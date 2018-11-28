@@ -450,7 +450,6 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
 def file_based_convert_examples_to_features(
     examples, label_list, max_seq_length, tokenizer, output_file):
   """Convert a set of `InputExample`s to a TFRecord file."""
-
   writer = tf.python_io.TFRecordWriter(output_file)
 
   for (ex_index, example) in enumerate(examples):
@@ -472,7 +471,6 @@ def file_based_convert_examples_to_features(
 
     tf_example = tf.train.Example(features=tf.train.Features(feature=features))
     writer.write(tf_example.SerializeToString())
-
 
 def file_based_input_fn_builder(input_file, seq_length, is_training,
                                 drop_remainder):
@@ -636,10 +634,15 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
       train_op = optimization.create_optimizer(
           total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
 
+      logging_hook = tf.train.LoggingTensorHook(
+                           {"loss": total_loss}, 
+                           every_n_iter=10)
+
       output_spec = tf.contrib.tpu.TPUEstimatorSpec(
           mode=mode,
           loss=total_loss,
           train_op=train_op,
+          training_hooks=[logging_hook],
           scaffold_fn=scaffold_fn)
     elif mode == tf.estimator.ModeKeys.EVAL:
 
