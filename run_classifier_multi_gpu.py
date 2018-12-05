@@ -21,6 +21,8 @@ from __future__ import print_function
 import collections
 import csv
 import os
+import six
+import itertools
 import modeling
 import optimization
 import tokenization
@@ -78,6 +80,8 @@ flags.DEFINE_bool(
 flags.DEFINE_integer("train_batch_size", 32, "Total batch size for training.")
 
 flags.DEFINE_integer("eval_batch_size", 8, "Total batch size for eval.")
+
+flags.DEFINE_integer("num_gpus", 4, "Total number of GPUs for traing & eval.")
 
 flags.DEFINE_integer("predict_batch_size", 8, "Total batch size for predict.")
 
@@ -450,7 +454,6 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
 def file_based_convert_examples_to_features(
     examples, label_list, max_seq_length, tokenizer, output_file):
   """Convert a set of `InputExample`s to a TFRecord file."""
-  """
   writer = tf.python_io.TFRecordWriter(output_file)
   for (ex_index, example) in enumerate(examples):
     if ex_index % 10000 == 0:
@@ -471,7 +474,7 @@ def file_based_convert_examples_to_features(
 
     tf_example = tf.train.Example(features=tf.train.Features(feature=features))
     writer.write(tf_example.SerializeToString())
-  """
+
 def file_based_input_fn_builder(input_file, seq_length, is_training,
                                 drop_remainder):
   """Creates an `input_fn` closure to be passed to TPUEstimator."""
@@ -500,6 +503,7 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
   def input_fn(params):
     """The actual input function."""
     batch_size = params["batch_size"]
+    num_gpus = FLAGS.num_gpus
 
     # For training, we want a lot of parallel reading and shuffling.
     # For eval, we want no shuffling and parallel reading doesn't matter.
@@ -513,7 +517,6 @@ def file_based_input_fn_builder(input_file, seq_length, is_training,
             lambda record: _decode_record(record, name_to_features),
             batch_size=batch_size,
             drop_remainder=drop_remainder))
-
     return d
 
   return input_fn
@@ -592,78 +595,135 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
     tf.logging.info("*** Features ***")
     for name in sorted(features.keys()):
       tf.logging.info("  name = %s, shape = %s" % (name, features[name].shape))
+    
+    num_gpus = FLAGS.num_gpus
+    if num_gpus == 0:
+      num_devices = 1
+      device_type = 'cpu'
+    else:
+      num_devices = num_gpus
+      device_type = 'gpu'
 
-    input_ids = features["input_ids"]
-    input_mask = features["input_mask"]
-    segment_ids = features["segment_ids"]
-    label_ids = features["label_ids"]
-
+    if num_devices > 1:
+      input_ids = tf.split(features["input_ids"], num_or_size_splits=num_gpus, axis=0)
+      input_mask = tf.split(features["input_mask"], num_or_size_splits=num_gpus, axis=0)
+      segment_ids = tf.split(features["segment_ids"], num_or_size_splits=num_gpus, axis=0)
+      label_ids = tf.split(features["label_ids"], num_or_size_splits=num_gpus, axis=0)
+    else:
+      input_ids = [features["input_ids"]]
+      input_mask = [features["input_mask"]]
+      segment_ids = [features["segment_ids"]]
+      label_ids = [features["label_ids"]]
+      
+    
     is_training = (mode == tf.estimator.ModeKeys.TRAIN)
 
-    (total_loss, per_example_loss, logits, probabilities) = create_model(
-        bert_config, is_training, input_ids, input_mask, segment_ids, label_ids,
-        num_labels, use_one_hot_embeddings)
+    
+    tower_losses = []
+    tower_gradvars = []
+    tower_logits = []
+    tower_per_example_loss = []
+    for i in xrange(num_devices):
+      worker_device = '/{}:{}'.format(device_type, i)
+      with tf.variable_scope(name_or_scope='finetune', reuse=bool(i != 0)):
+	with tf.name_scope('tower_%d' % i):
+	  with tf.device(worker_device):
+	    (total_loss, per_example_loss, logits, probabilities) = create_model(
+	       bert_config, is_training, input_ids[i], input_mask[i], segment_ids[i], label_ids[i],
+	       num_labels, use_one_hot_embeddings)
 
-    tvars = tf.trainable_variables()
+	    tvars = tf.trainable_variables()
+	    tower_grad = tf.gradients(total_loss, tvars)
+	    gradvars = zip(tower_grad, tvars)
+
+	    tower_losses.append(total_loss)
+	    tower_gradvars.append(gradvars)
+	    tower_logits.append(logits)
+            tower_per_example_loss.append(per_example_loss)
+
     initialized_variable_names = {}
     scaffold_fn = None
     if init_checkpoint:
       (assignment_map, initialized_variable_names
-      ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint)
+      ) = modeling.get_assignment_map_from_checkpoint(tvars, init_checkpoint, 
+		   new_scope_name='finetune')
       if use_tpu:
 
-        def tpu_scaffold():
-          tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-          return tf.train.Scaffold()
+	def tpu_scaffold():
+	  tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
+	  return tf.train.Scaffold()
 
-        scaffold_fn = tpu_scaffold
+	scaffold_fn = tpu_scaffold
       else:
-        tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
-
+	tf.train.init_from_checkpoint(init_checkpoint, assignment_map)
     tf.logging.info("**** Trainable Variables ****")
     for var in tvars:
       init_string = ""
       if var.name in initialized_variable_names:
-        init_string = ", *INIT_FROM_CKPT*"
+	init_string = ", *INIT_FROM_CKPT*"
       tf.logging.info("  name = %s, shape = %s%s", var.name, var.shape,
-                      init_string)
+		      init_string)
+   
+    gradvars = []
+    with tf.name_scope('gradient_averaging'):
+      all_grads = {}
+      for grad, var in itertools.chain(*tower_gradvars):
+	if grad is not None:
+	    all_grads.setdefault(var, []).append(grad)
+      for var, grads in six.iteritems(all_grads):
+	with tf.device(var.device):
+	  if len(grads) == 1:
+	    avg_grad = grads[0]
+	  else:
+	    avg_grad = tf.multiply(tf.add_n(grads), 1/len(grads)) 
+	gradvars.append((avg_grad, var))
 
+
+    consolidation_device = '/gpu:0' if num_gpus > 0 else '/cpu:0'
     output_spec = None
     if mode == tf.estimator.ModeKeys.TRAIN:
+      with tf.device(consolidation_device):
+        total_loss = tf.reduce_mean(tower_losses)
+	train_op = optimization.create_optimizer(
+	    total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu, gradvars=gradvars)
 
-      train_op = optimization.create_optimizer(
-          total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
+        if num_devices > 1:
+          stacked_logits = tf.concat(tower_logits, axis=0)
+        else:
+          stacked_logits = tower_logits[0]
+	predictions = tf.argmax(stacked_logits, axis=-1, output_type=tf.int32)
+	accuracy = tf.reduce_mean(tf.cast(tf.equal(features["label_ids"], predictions), tf.float32), name="train_acc")
+        
 
-      predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
-      accuracy = tf.reduce_mean(tf.cast(tf.equal(label_ids, predictions), tf.float32), name="train_acc")
+	logging_hook = tf.train.LoggingTensorHook(
+			     {"loss": total_loss, "train_accuracy": accuracy}, 
+			     every_n_iter=10)
 
-      logging_hook = tf.train.LoggingTensorHook(
-                           {"loss": total_loss, "train_accuracy": accuracy}, 
-                           every_n_iter=10)
-
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode,
-          loss=total_loss,
-          train_op=train_op,
-          training_hooks=[logging_hook],
-          scaffold_fn=scaffold_fn)
+	output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+	    mode=mode,
+	    loss=total_loss,
+	    train_op=train_op,
+	    training_hooks=[logging_hook],
+	    scaffold_fn=scaffold_fn)
     elif mode == tf.estimator.ModeKeys.EVAL:
+      with tf.device(consolidation_device):
+	def metric_fn(per_example_loss, label_ids, logits):
+	  predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
+	  accuracy = tf.metrics.accuracy(label_ids, predictions)
+	  loss = tf.metrics.mean(per_example_loss)
+	  return {
+	      "eval_accuracy": accuracy,
+	      "eval_loss": loss,
+	  }
 
-      def metric_fn(per_example_loss, label_ids, logits):
-        predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
-        accuracy = tf.metrics.accuracy(label_ids, predictions)
-        loss = tf.metrics.mean(per_example_loss)
-        return {
-            "eval_accuracy": accuracy,
-            "eval_loss": loss,
-        }
-
-      eval_metrics = (metric_fn, [per_example_loss, label_ids, logits])
-      output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-          mode=mode,
-          loss=total_loss,
-          eval_metrics=eval_metrics,
-          scaffold_fn=scaffold_fn)
+        stacked_logits = tf.concat(tower_logits, axis=0) if num_devices > 1 else tower_logits[0] 
+        stacked_per_example_loss = tf.concat(tower_per_example_loss, axis=0) if num_devices > 1 else tower_per_example_loss[0]
+	eval_metrics = (metric_fn, [stacked_per_example_loss, features["label_ids"], stacked_logits])
+	output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+	    mode=mode,
+	    loss=total_loss,
+	    eval_metrics=eval_metrics,
+	    scaffold_fn=scaffold_fn)
     else:
       output_spec = tf.contrib.tpu.TPUEstimatorSpec(
           mode=mode, predictions=probabilities, scaffold_fn=scaffold_fn)

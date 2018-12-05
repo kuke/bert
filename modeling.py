@@ -315,10 +315,13 @@ def get_activation(activation_string):
     raise ValueError("Unsupported activation: %s" % act)
 
 
-def get_assignment_map_from_checkpoint(tvars, init_checkpoint):
+def get_assignment_map_from_checkpoint(tvars, init_checkpoint, new_scope_name=None):
   """Compute the union of the current variables and checkpoint variables."""
   assignment_map = {}
   initialized_variable_names = {}
+
+  if new_scope_name is not None and not new_scope_name.endswith('/'):
+    new_scope_name += '/'
 
   name_to_variable = collections.OrderedDict()
   for var in tvars:
@@ -326,8 +329,10 @@ def get_assignment_map_from_checkpoint(tvars, init_checkpoint):
     m = re.match("^(.*):\\d+$", name)
     if m is not None:
       name = m.group(1)
+    if new_scope_name is not None:
+      name = name[len(new_scope_name):]
     name_to_variable[name] = var
-
+ 
   init_vars = tf.train.list_variables(init_checkpoint)
 
   assignment_map = collections.OrderedDict()
@@ -335,9 +340,14 @@ def get_assignment_map_from_checkpoint(tvars, init_checkpoint):
     (name, var) = (x[0], x[1])
     if name not in name_to_variable:
       continue
-    assignment_map[name] = name
-    initialized_variable_names[name] = 1
-    initialized_variable_names[name + ":0"] = 1
+    if new_scope_name is not None:
+      assignment_map[name] = new_scope_name + name
+      initialized_variable_names[new_scope_name + name] = 1
+      initialized_variable_names[new_scope_name + name + ":0"] = 1
+    else:
+      assignment_map[name] = name
+      initialized_variable_names[name] = 1
+      initialized_variable_names[name + ":0"] = 1
 
   return (assignment_map, initialized_variable_names)
 
